@@ -46,7 +46,7 @@ class App:
         self.events = queue.Queue()
         self.exit_requested = False
         self.tray = Tray(self.events)
-        window.bind('<Destroy>', lambda event: self.tray.close() if event.widget is window else None, add='+')
+        window.bind('<Destroy>', self.destroyed, add='+')
         self.refreshing = False
         self.last_refresh = 0
         self.login_process = None
@@ -54,6 +54,7 @@ class App:
         self.working = False
         self.runner_process = None
         self.initial_view = True
+        window.report_callback_exception = self.callback_error
         window.title('Claude Max 账号与额度')
         window.protocol('WM_DELETE_WINDOW', self.close)
         window.geometry('1050x760')
@@ -119,7 +120,7 @@ class App:
         window.minsize(width, height)
         window.after(100, self.poll)
         window.after(200, self.refresh)
-        window.after(300000, self.auto_refresh)
+        window.after(1000, self.auto_refresh)
         window.after(1000, self.tick)
 
     def build_cards(self):
@@ -170,22 +171,48 @@ class App:
         if time.time() - self.last_refresh < 30:
             self.note.config(text='请间隔至少 30 秒再查询，避免触发官方频率限制。')
             return
+        slots = self.store.slots()
         self.refreshing = True
         self.last_refresh = time.time()
         self.refresh_button.state(['disabled'])
-        slots = self.store.slots()
         self.note.config(text=f'正在向官方查询 {len(slots)} 个账号的额度…')
         def work():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                tasks = {pool.submit(self.store.quota, s): s for s in slots}
-                for task in concurrent.futures.as_completed(tasks):
-                    slot = tasks[task]
-                    try:
-                        self.events.put(('quota', task.result()))
-                    except Exception:
-                        self.events.put(('quota', {'slot': slot, 'error': '无法读取账号配置，请重新授权或检查配置文件'}))
-            self.events.put(('done', None))
-        threading.Thread(target=work, daemon=True).start()
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    tasks = {pool.submit(self.store.quota, s): s for s in slots}
+                    for task in concurrent.futures.as_completed(tasks):
+                        slot = tasks[task]
+                        try:
+                            self.events.put(('quota', task.result()))
+                        except Exception as exc:
+                            self.events.put(('quota', {'slot': slot, 'error': '无法读取账号配置：' + type(exc).__name__,
+                                                      'next_poll': time.time() + 180}))
+            except Exception as exc:
+                for slot in slots:
+                    self.events.put(('quota', {'slot': slot, 'error': '查询任务异常：' + type(exc).__name__,
+                                              'next_poll': time.time() + 180}))
+            finally:
+                self.events.put(('done', None))
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception:
+            self.refreshing = False
+            self.refresh_button.state(['!disabled'])
+            raise
+
+    def callback_error(self, kind, value, traceback):
+        # Pythonw has no visible stderr. Report only the class, never raw credentials.
+        self.note.config(text=f'监控回调异常：{kind.__name__}；后续定时检查继续运行。')
+        try:
+            self.store.log('monitor_error', reason=kind.__name__)
+        except Exception as exc:
+            self.note.config(text=f'监控异常：{kind.__name__}；日志写入失败：{type(exc).__name__}。请检查本地文件。')
+
+    def destroyed(self, event):
+        if event.widget is self.window:
+            for timer in self.window.tk.call('after', 'info'):
+                self.window.after_cancel(timer)
+            self.tray.close()
 
     def render(self, data):
         slot = data['slot']
@@ -228,6 +255,8 @@ class App:
             resets[key].config(text=reset_text(data['windows'][key].get('resets_at')))
 
     def poll(self):
+        # Arm before processing: a malformed row or disk error cannot kill the loop.
+        self.window.after(150, self.poll)
         try:
             while True:
                 kind, value = self.events.get_nowait()
@@ -240,18 +269,24 @@ class App:
                     self.show_window()
                     messagebox.showerror('托盘异常', value)
                 elif kind == 'quota':
-                    self.render(value)
+                    try:
+                        self.render(value)
+                    except Exception as exc:
+                        self.results[value['slot']] = {**value, 'error': '显示数据异常：' + type(exc).__name__}
+                        raise
                 elif kind == 'done':
                     self.refreshing = False
                     self.refresh_button.state(['!disabled'])
                     ok = sum(not d.get('error') for d in self.results.values())
-                    self.note.config(text=f'更新于 {dt.datetime.now():%H:%M:%S} · {ok}/{len(self.cards)} 个账号有有效额度数据 · 查询缓存与限频退避已启用')
-                    write(self.store.root / 'last-status.json', {'checked': dt.datetime.now().astimezone().isoformat(), 'accounts': list(self.results.values())})
+                    fresh = sum(not d.get('cached') and not d.get('error') for d in self.results.values())
+                    self.note.config(text=f'检查完成 {dt.datetime.now():%H:%M:%S} · {ok}/{len(self.cards)} 个账号有有效数据，本轮 {fresh} 个获得新额度 · 实际数据时间见卡片')
                     if self.initial_view:
                         self.canvas.yview_moveto(0)
                         self.initial_view = False
                     if self.auto_value.get() and not self.login_process and not self.exit_requested:
                         self.run_job(lambda: self.store.auto_step(list(self.results.values())), 'auto')
+                    write(self.store.root / 'last-status.json', {'checked': dt.datetime.now().astimezone().isoformat(), 'accounts': list(self.results.values())})
+                    self.store.log('quota_cycle', reason=f'fresh={fresh}; valid={ok}; total={len(self.cards)}')
                 elif kind == 'job':
                     label, result, error = value
                     self.working = False
@@ -306,13 +341,17 @@ class App:
             return
         if self.window.state() == 'iconic':
             self.close()
-        self.window.after(150, self.poll)
 
     def auto_refresh(self):
         if self.exit_requested:
             return
-        self.refresh()
-        self.window.after(self.store.settings()['poll_seconds'] * 1000, self.auto_refresh)
+        # This is a local deadline check, not an API request every second.
+        # Store.quota remains authoritative for cache and Retry-After deadlines.
+        self.window.after(1000, self.auto_refresh)
+        if self.refreshing or self.working or self.login_process or time.time() - self.last_refresh < 30:
+            return
+        if any(self.results.get(slot, {}).get('next_poll', 0) <= time.time() for slot in self.cards):
+            self.refresh()
 
     def refresh_after_enrollment(self):
         if self.refreshing:
@@ -358,10 +397,10 @@ class App:
 
     def tick(self):
         if self.window.winfo_exists():
+            self.window.after(30000, self.tick)
             for slot, data in list(self.results.items()):
                 if slot in self.cards:
                     self.render(data)
-            self.window.after(30000, self.tick)
 
     def toggle_auto(self):
         self.store.save_settings({'auto_enabled': self.auto_value.get()})
