@@ -58,14 +58,17 @@ def main():
                             '-WindowHandle', str(handle), '-OutputPath', str(output)],
                             creationflags=subprocess.CREATE_NO_WINDOW)
             deadline = time.monotonic() + 30
-            while capture.poll() is None:
-                # PrintWindow asks Tk to paint; keep its event loop responsive.
-                window.update()
-                if time.monotonic() > deadline:
+            def capture_done():
+                if capture.poll() is not None:
+                    window.quit()
+                elif time.monotonic() > deadline:
                     capture.kill()
                     capture.wait()
-                    raise TimeoutError('Demo window capture timed out')
-                time.sleep(.02)
+                    window.quit()
+                else:
+                    window.after(30, capture_done)
+            window.after(30, capture_done)
+            window.mainloop()
             if capture.returncode:
                 raise RuntimeError('Demo window capture failed')
             window.destroy()

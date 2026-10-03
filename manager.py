@@ -24,6 +24,7 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 from core import read, write, running_claude
 from enhanced import Store, runner_active
+from desktop import Tray, create_shortcut, restore_existing
 
 
 def reset_text(value):
@@ -43,6 +44,9 @@ class App:
         self.store.init_first()
         self.results = {}
         self.events = queue.Queue()
+        self.exit_requested = False
+        self.tray = Tray(self.events)
+        window.bind('<Destroy>', lambda event: self.tray.close() if event.widget is window else None, add='+')
         self.refreshing = False
         self.last_refresh = 0
         self.login_process = None
@@ -75,6 +79,7 @@ class App:
         self.refresh_button.pack(side='right')
         self.add_button = ttk.Button(head, text='＋ 增加账号', command=self.add_account)
         self.add_button.pack(side='right', padx=10)
+        ttk.Button(head, text='添加桌面快捷方式', command=self.add_shortcut).pack(side='right', padx=(8, 0))
         self.subtitle = ttk.Label(outer, text=f'官方额度 · 每 {self.store.settings()["poll_seconds"]} 秒查询 · 时间按 Windows 本地时区显示')
         self.subtitle.pack(anchor='w', pady=(8, 16))
         self.current_label = ttk.Label(outer, text='读取默认账号…')
@@ -160,7 +165,7 @@ class App:
                 self.render(data)
 
     def refresh(self):
-        if self.refreshing:
+        if self.exit_requested or self.refreshing:
             return
         if time.time() - self.last_refresh < 30:
             self.note.config(text='请间隔至少 30 秒再查询，避免触发官方频率限制。')
@@ -226,7 +231,15 @@ class App:
         try:
             while True:
                 kind, value = self.events.get_nowait()
-                if kind == 'quota':
+                if kind == 'tray':
+                    if value == 'exit':
+                        self.exit_app()
+                    else:
+                        self.show_window()
+                elif kind == 'tray_error':
+                    self.show_window()
+                    messagebox.showerror('托盘异常', value)
+                elif kind == 'quota':
                     self.render(value)
                 elif kind == 'done':
                     self.refreshing = False
@@ -237,7 +250,7 @@ class App:
                     if self.initial_view:
                         self.canvas.yview_moveto(0)
                         self.initial_view = False
-                    if self.auto_value.get() and not self.login_process:
+                    if self.auto_value.get() and not self.login_process and not self.exit_requested:
                         self.run_job(lambda: self.store.auto_step(list(self.results.values())), 'auto')
                 elif kind == 'job':
                     label, result, error = value
@@ -288,9 +301,16 @@ class App:
                     self.refresh()
         except queue.Empty:
             pass
+        if self.exit_requested and not (self.working or self.refreshing or self.login_process):
+            self.window.destroy()
+            return
+        if self.window.state() == 'iconic':
+            self.close()
         self.window.after(150, self.poll)
 
     def auto_refresh(self):
+        if self.exit_requested:
+            return
         self.refresh()
         self.window.after(self.store.settings()['poll_seconds'] * 1000, self.auto_refresh)
 
@@ -302,16 +322,30 @@ class App:
             self.refresh()
 
     def close(self):
-        if self.login_process or self.working or self.refreshing:
-            messagebox.showinfo('操作进行中', '请等待额度查询或账号操作完成；若正在授权，请先完成或关闭官方授权窗口。')
+        if not self.tray.hwnd or not self.tray.thread.is_alive():
+            messagebox.showerror('无法隐藏窗口', '系统托盘不可用，请保持窗口打开。')
             return
-        if self.auto_value.get():
-            self.window.iconify()
+        self.window.withdraw()
+
+    def show_window(self):
+        self.window.deiconify()
+        self.window.state('normal')
+        self.window.lift()
+        self.window.focus_force()
+
+    def exit_app(self):
+        if self.login_process:
+            self.show_window()
+            messagebox.showinfo('授权进行中', '请先完成或关闭官方授权窗口，保存授权结果后再退出。')
             return
-        self.window.destroy()
+        self.exit_requested = True
+        self.note.config(text='正在退出，等待当前查询或账号写入完成…')
+
+    def add_shortcut(self):
+        self.run_job(lambda: '已添加桌面快捷方式：' + create_shortcut(HERE / 'manager.py'), 'shortcut')
 
     def run_job(self, action, label):
-        if self.working or self.refreshing or self.login_process:
+        if self.exit_requested or self.working or self.refreshing or self.login_process:
             self.auto_label.config(text='正在查询或授权，完成后可继续操作。')
             return
         self.working = True
@@ -331,7 +365,7 @@ class App:
 
     def toggle_auto(self):
         self.store.save_settings({'auto_enabled': self.auto_value.get()})
-        self.auto_label.config(text='自动模式已开启；关闭窗口将最小化并继续监控' if self.auto_value.get() else '自动模式已关闭')
+        self.auto_label.config(text='自动模式已开启；关闭窗口后在托盘继续监控' if self.auto_value.get() else '自动模式已关闭；托盘右键可退出')
         if self.auto_value.get():
             self.run_job(lambda: self.store.auto_step(list(self.results.values())), 'auto')
 
@@ -564,7 +598,8 @@ def main():
     kernel.CreateMutexW.restype = ctypes.c_void_p
     mutex = kernel.CreateMutexW(None, False, 'Local\\ClaudeMaxManager')
     if kernel.GetLastError() == 183:
-        ctypes.windll.user32.MessageBoxW(0, '账号工具已经打开，请查看任务栏。', 'Claude Max', 0)
+        if not restore_existing():
+            ctypes.windll.user32.MessageBoxW(0, '账号工具已经打开，请查看任务栏或系统托盘。', 'Claude Max', 0)
         return
     window = tk.Tk()
     try:
