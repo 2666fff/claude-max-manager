@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+# Local reports and original, unredacted screenshots
+/last-status.json
+/preview.png
+/codex_temp.txt
+# Never publish account material, session transcripts or task prompts
+.claude/
+.claude-max-accounts/
+.credentials.json
+.claude.json
+max-*/
+.enroll-*/
+switch-backup/
+pending-switch.json
+.refresh-result.json
+usage-cache.json
+events*.jsonl
+runner.json
+runner.stop
+task-*.txt
+*.log
+*.tmp
