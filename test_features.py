@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import urllib.error
 
@@ -125,19 +126,53 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(retry_seconds('60'),60)
         self.assertEqual(retry_seconds('Thu, 01 Jan 1970 00:10:00 GMT',now=0),600)
 
-    def test_auto_waits_for_process_and_respects_cooldown(self):
+    def test_auto_switches_running_process_and_respects_cooldown(self):
         self.store.save_settings({'auto_enabled':True})
         rows=[self.row(1,100,20),self.row(2,10,20)]
         self.store.process_check=lambda:[8888]
         with patch('enhanced.runner_active',return_value=False), patch.object(self.store,'switch') as switch:
-            self.assertIn('需退出',self.store.auto_step(rows))
-            switch.assert_not_called()
-            self.store.process_check=lambda:[]
             self.assertIn('已自动切换到账号 2',self.store.auto_step(rows))
-            switch.assert_called_once_with(2)
+            switch.assert_called_once_with(2, allow_running=True)
             write(self.root/'rotation.json',{'last_switch':time.time()})
             self.assertIn('冷却',self.store.auto_step(rows))
             self.assertEqual(switch.call_count,1)
+
+    def test_live_switch_preserves_shared_state_and_uses_all_locks(self):
+        self.store.process_check=lambda:[123]
+        config=read(self.store.config)
+        config['mcpServers']={'fixture':{'command':'fixture-command'}}
+        config['projects']={'fixture-project':{'hasTrustDialogAccepted':True}}
+        write(self.store.config,config)
+        def verify(*args,**kwargs):
+            for lock in [self.live/'.oauth_refresh.lock',self.live.with_name('live.lock'),self.store.config.with_name('.claude.json.lock')]:
+                self.assertTrue(lock.is_dir())
+            return SimpleNamespace(returncode=0,stdout=json.dumps({'loggedIn':True,'email':'account-2@example.invalid'}))
+        with patch('enhanced.require_live_switch_support'), patch('core.subprocess.run',side_effect=verify):
+            self.assertIn('后续请求',self.store.switch(2,allow_running=True))
+        self.assertEqual(self.store.current(),'uuid-2')
+        self.assertEqual(read(self.live/'.credentials.json')['mcpOAuth'],{'keep':'fixture'})
+        self.assertEqual(read(self.store.config)['mcpServers'],config['mcpServers'])
+        self.assertEqual(read(self.store.config)['projects'],config['projects'])
+        self.assertFalse((self.root/'pending-switch.json').exists())
+        self.assertFalse((self.live/'.oauth_refresh.lock').exists())
+
+    def test_failed_live_switch_restores_credentials_and_identity(self):
+        self.store.process_check=lambda:[123]
+        before=[read(p) for p in [self.store.config,self.live/'.credentials.json']]
+        rejected=SimpleNamespace(returncode=0,stdout=json.dumps({'loggedIn':True,'email':'unexpected@example.invalid'}))
+        with patch('enhanced.require_live_switch_support'), patch('core.subprocess.run',return_value=rejected):
+            with self.assertRaises(RuntimeError):self.store.switch(2,allow_running=True)
+        self.assertEqual(before,[read(p) for p in [self.store.config,self.live/'.credentials.json']])
+        self.assertFalse((self.root/'pending-switch.json').exists())
+
+    def test_unverified_version_cannot_live_switch(self):
+        self.store.process_check=lambda:[123]
+        before=(self.live/'.credentials.json').read_bytes()
+        version=SimpleNamespace(returncode=0,stdout='0.0.0 (fixture)')
+        with patch('enhanced.subprocess.run',return_value=version):
+            with self.assertRaisesRegex(RuntimeError,'尚未验证'):
+                self.store.switch(2,allow_running=True)
+        self.assertEqual(before,(self.live/'.credentials.json').read_bytes())
 
     def test_exhausted_pool_waits_and_runner_owns_rotation(self):
         self.store.save_settings({'auto_enabled':True})

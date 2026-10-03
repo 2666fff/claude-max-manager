@@ -146,9 +146,9 @@ class Store:
             result['error'] = '网络超时或响应无效，稍后刷新'
         return result
 
-    def switch(self, slot):
+    def switch(self, slot, *, allow_running=False):
         processes = self.process_check()
-        if processes:
+        if processes and not allow_running:
             raise RuntimeError('Claude Code 仍在运行（PID ' + ', '.join(map(str, processes)) +
                 '）。请先在原终端保存进度并退出 Claude，再切换；本工具不会强行终止任务。')
         incoming_config = read(self.profile(slot) / '.claude.json')
@@ -183,7 +183,7 @@ class Store:
                     'passesEligibilityCache', 'clientDataCacheSlots', 'promoStartupStatusCache',
                     'modelAccessCache', 'orgModelDefaultCache', 'cachedArtifactRoster']:
             updated.pop(key, None)
-        if self.process_check():
+        if self.process_check() and not allow_running:
             raise RuntimeError('切换前发现新启动的 Claude Code，已取消切换。')
         pending = self.root / 'pending-switch.json'
         write(pending, {'from': old_slot, 'to': slot})
@@ -206,4 +206,6 @@ class Store:
             write(self.config, original_config)
             pending.unlink(missing_ok=True)
             raise
-        return '已切换到 ' + identity['emailAddress'] + '。新启动的 Claude Code 将使用此账号。'
+        return ('已切换到 ' + identity['emailAddress'] +
+                ('。运行中会话的后续请求将读取新凭据；已发出的请求不变，限额后的消息需重新提交。' if allow_running
+                 else '。新启动的 Claude Code 将使用此账号。'))

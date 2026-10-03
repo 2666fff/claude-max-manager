@@ -82,7 +82,7 @@ class App:
         toolbar = ttk.Frame(outer)
         toolbar.pack(fill='x', pady=(0, 12))
         self.auto_value = tk.BooleanVar(value=self.store.settings()['auto_enabled'])
-        ttk.Checkbutton(toolbar, text='空闲时自动换号', variable=self.auto_value, command=self.toggle_auto).pack(side='left')
+        ttk.Checkbutton(toolbar, text='自动换号', variable=self.auto_value, command=self.toggle_auto).pack(side='left')
         ttk.Button(toolbar, text='选择可用账号', command=self.best_account).pack(side='left', padx=6)
         ttk.Button(toolbar, text='受管任务', command=self.managed_dialog).pack(side='left', padx=6)
         ttk.Button(toolbar, text='设置', command=self.settings_dialog).pack(side='right')
@@ -106,7 +106,7 @@ class App:
         self.build_cards()
         self.note = ttk.Label(outer, text='正在读取官方额度…', wraplength=970)
         self.note.pack(anchor='w', pady=(14, 4))
-        ttk.Label(outer, text='普通终端会话需退出后切换；受管任务可在额度中断后换号接续。', foreground='#657085').pack(anchor='w')
+        ttk.Label(outer, text='运行中换号对后续请求生效；已限额的消息需重新提交，或由受管任务接续。', foreground='#657085').pack(anchor='w')
         window.update_idletasks()
         width = max(1050, window.winfo_reqwidth())
         height = min(max(760, window.winfo_reqheight()), window.winfo_screenheight() - 100)
@@ -388,7 +388,7 @@ class App:
             value = tk.StringVar(value=str(current[key]))
             ttk.Entry(body, textvariable=value, width=24).grid(row=row, column=1, padx=12)
             fields[key] = value
-        ttk.Label(body, text='访问令牌按需自动刷新；刷新授权失效时提示重新登录。\n自动模式仅在没有普通 Claude 进程时切换。\n受管任务在确认额度错误并退出后换号、恢复同一会话。', wraplength=520).grid(row=4, column=0, columnspan=2, pady=12)
+        ttk.Label(body, text='访问令牌按需自动刷新；刷新授权失效时提示重新登录。\n已验证 Windows Claude 2.1.288 运行中切换，后续请求生效。\n已经发出的请求不变；受管任务可在额度中断后换号接续。', wraplength=520).grid(row=4, column=0, columnspan=2, pady=12)
         def save():
             try:
                 values = {k: (v.get().strip() if k == 'model' else int(v.get())) for k, v in fields.items()}
@@ -521,14 +521,11 @@ class App:
         try:
             if runner_active():
                 raise RuntimeError('受管任务正在管理账号，请先在“受管任务”中停止它，再手动切换。')
-            processes = self.store.process_check()
-            if processes:
-                raise RuntimeError('Claude Code 仍在运行（PID ' + ', '.join(map(str, processes)) + '）。请在原终端保存进度并退出 Claude，再点击切换。')
             result = self.results.get(slot, {})
             exhausted = any(w.get('utilization', 0) >= 100 for w in result.get('windows', {}).values())
             if exhausted and not messagebox.askyesno('目标账号额度已耗尽', '该账号有额度窗口已耗尽。仍要将它设为默认账号吗？'):
                 return
-            self.run_job(lambda: self.store.switch(slot), 'switch')
+            self.run_job(lambda: self.store.switch(slot, allow_running=True), 'switch')
         except Exception as exc:
             messagebox.showerror('未切换账号', str(exc))
 

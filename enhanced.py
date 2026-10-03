@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -81,6 +82,17 @@ def runner_active():
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel.CloseHandle(handle)
     return True
+
+
+def require_live_switch_support():
+    """Gate live writes on the exact native CLI version exercised end to end."""
+    if sys.platform != 'win32':
+        raise RuntimeError('运行中切换目前只在 Windows 验证；请退出 Claude 后切换。')
+    result = subprocess.run([str(accounts.CLI), '--version'], capture_output=True,
+                            encoding='utf-8', timeout=15, creationflags=NO_WINDOW)
+    version = result.stdout.strip().split(' ', 1)[0]
+    if result.returncode or version != '2.1.288':
+        raise RuntimeError('此 Claude 版本尚未验证运行中切换（已验证 2.1.288）；请退出 Claude 后切换。')
 
 
 class Store(BasicStore):
@@ -327,10 +339,18 @@ class Store(BasicStore):
                 usable.append((level, slot))
         return min(usable)[1] if usable else None
 
-    def switch(self, slot):
+    def switch(self, slot, *, allow_running=False):
+        # Resolve compatibility before acquiring the official file-write locks.
+        if allow_running and self.process_check():
+            require_live_switch_support()
+            active_pids = self.process_check()
+            for path in (self.live / 'sessions').glob('*.json'):
+                info = read(path)
+                if info.get('pid') in active_pids and info.get('version') not in (None, '2.1.288'):
+                    raise RuntimeError('发现未验证版本的运行中会话，请退出该会话后切换。')
         self.token(slot)
         with self.mutex, directory_lock(self.root / '.manager.lock'), self.credential_locks(self.live, self.config):
-            message = super().switch(slot)
+            message = super().switch(slot, allow_running=allow_running)
             write(self.root / 'rotation.json', {'last_switch': time.time(), 'slot': slot})
             self.log('account_switched', slot=slot)
             return message
@@ -354,7 +374,5 @@ class Store(BasicStore):
             return '没有额度充足且启用的备用账号，等待额度恢复'
         if self.relevant(current) - self.relevant(next(r for r in rows if r['slot'] == target)) < settings['min_improvement']:
             return '备用额度差异较小，保持当前账号'
-        if self.process_check():
-            return '已有可用备用账号；普通会话需退出，受管会话将在限额中断后自动接续'
-        self.switch(target)
-        return f'已自动切换到账号 {target}'
+        self.switch(target, allow_running=True)
+        return f'已自动切换到账号 {target}，后续请求使用新账号；已限额的消息需重新提交或由受管任务接续'
