@@ -127,8 +127,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(retry_seconds('Thu, 01 Jan 1970 00:10:00 GMT',now=0),600)
 
     def test_auto_switches_running_process_and_respects_cooldown(self):
-        self.store.save_settings({'auto_enabled':True})
-        rows=[self.row(1,100,20),self.row(2,10,20)]
+        self.store.save_settings({'auto_enabled':True,'threshold':95})
+        rows=[self.row(1,96,20),self.row(2,10,20)]
         self.store.process_check=lambda:[8888]
         with patch('enhanced.runner_active',return_value=False), patch.object(self.store,'switch') as switch:
             self.assertIn('已自动切换到账号 2',self.store.auto_step(rows))
@@ -136,6 +136,24 @@ class ContractTests(unittest.TestCase):
             write(self.root/'rotation.json',{'last_switch':time.time()})
             self.assertIn('冷却',self.store.auto_step(rows))
             self.assertEqual(switch.call_count,1)
+
+    def test_default_99_boundary_ignores_cooldown_and_small_margin(self):
+        self.assertTrue(self.store.settings()['auto_enabled'])
+        self.assertEqual(self.store.settings()['threshold'],99)
+        write(self.root/'rotation.json',{'last_switch':time.time()})
+        with patch('enhanced.runner_active',return_value=False), patch.object(self.store,'switch') as switch:
+            self.store.auto_step([self.row(1,98.99,20),self.row(2,98,20)])
+            switch.assert_not_called()
+            self.assertIn('已自动切换到账号 2',self.store.auto_step([self.row(1,99,20),self.row(2,98,20)]))
+            switch.assert_called_once_with(2,allow_running=True)
+
+    def test_weekly_99_switches_to_best_usable_account(self):
+        with patch('enhanced.runner_active',return_value=False), patch.object(self.store,'switch') as switch:
+            self.store.auto_step([self.row(1,12,99),self.row(2,80,20),self.row(5,20,10)])
+            switch.assert_called_once_with(5,allow_running=True)
+            switch.reset_mock()
+            self.store.auto_step([self.row(1,99,20),self.row(2,0,100),self.row(5,99,0)])
+            switch.assert_not_called()
 
     def test_live_switch_preserves_shared_state_and_uses_all_locks(self):
         self.store.process_check=lambda:[123]

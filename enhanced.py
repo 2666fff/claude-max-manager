@@ -96,7 +96,7 @@ def require_live_switch_support():
 
 
 class Store(BasicStore):
-    DEFAULTS = {'auto_enabled': False, 'threshold': 95, 'cooldown': 300,
+    DEFAULTS = {'auto_enabled': True, 'threshold': 99, 'cooldown': 300,
                 'poll_seconds': 300, 'model': '', 'min_improvement': 5}
 
     def __init__(self, *args, **kwargs):
@@ -364,15 +364,18 @@ class Store(BasicStore):
         current = next((r for r in rows if self.identity(r['slot'])['accountUuid'] == self.current()), None)
         if not current or self.relevant(current) is None:
             return '当前额度未知，等待有效查询结果'
-        if self.relevant(current) < settings['threshold']:
+        current_level = self.relevant(current)
+        if current_level < settings['threshold']:
             return '自动监控中，当前账号尚未达到切换阈值'
+        # Near exhaustion, usable alternatives must not be blocked by hysteresis.
+        urgent = current_level >= 99
         rotation = self.root / 'rotation.json'
-        if rotation.exists() and time.time() - read(rotation)['last_switch'] < settings['cooldown']:
+        if not urgent and rotation.exists() and time.time() - read(rotation)['last_switch'] < settings['cooldown']:
             return '切换冷却中，避免账号来回切换'
         target = self.choose(rows, exclude=[current['slot']])
         if target is None:
             return '没有额度充足且启用的备用账号，等待额度恢复'
-        if self.relevant(current) - self.relevant(next(r for r in rows if r['slot'] == target)) < settings['min_improvement']:
+        if not urgent and current_level - self.relevant(next(r for r in rows if r['slot'] == target)) < settings['min_improvement']:
             return '备用额度差异较小，保持当前账号'
         self.switch(target, allow_running=True)
         return f'已自动切换到账号 {target}，后续请求使用新账号；已限额的消息需重新提交或由受管任务接续'
