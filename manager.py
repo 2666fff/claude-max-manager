@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk, messagebox, simpledialog, filedialog
 import urllib.error
 import urllib.request
@@ -70,12 +71,12 @@ class App:
         style.configure('Card.TFrame', background='white')
         style.configure('TLabel', background='#f3f5f8', font=('Microsoft YaHei UI', 10))
         style.configure('Card.TLabel', background='white', font=('Microsoft YaHei UI', 10))
-        style.configure('Title.TLabel', font=('Microsoft YaHei UI', 20, 'bold'))
+        style.configure('Title.TLabel', font=('Microsoft YaHei UI', 18, 'bold'))
         style.configure('Name.TLabel', background='white', font=('Microsoft YaHei UI', 12, 'bold'))
         style.configure('TButton', font=('Microsoft YaHei UI', 10), padding=(10, 6))
         style.configure('Blue.Horizontal.TProgressbar', background='#3864d8', troughcolor='#e8edf5')
         style.configure('Red.Horizontal.TProgressbar', background='#ce4850', troughcolor='#f9e8e9')
-        outer = ttk.Frame(window, padding=24)
+        outer = ttk.Frame(window, padding=16)
         outer.pack(fill='both', expand=True)
         head = ttk.Frame(outer)
         head.pack(fill='x')
@@ -85,12 +86,12 @@ class App:
         self.add_button = ttk.Button(head, text='＋ 增加账号', command=self.add_account)
         self.add_button.pack(side='right', padx=10)
         ttk.Button(head, text='添加桌面快捷方式', command=self.add_shortcut).pack(side='right', padx=(8, 0))
-        self.subtitle = ttk.Label(outer, text=f'官方额度 · 每 {self.store.settings()["poll_seconds"]} 秒查询 · 时间按 Windows 本地时区显示')
-        self.subtitle.pack(anchor='w', pady=(8, 16))
-        self.current_label = ttk.Label(outer, text='读取默认账号…')
-        self.current_label.pack(anchor='w', pady=(0, 12))
+        self.subtitle = ttk.Label(outer, text=self.poll_description())
+        self.subtitle.pack(anchor='w', pady=(6, 8))
+        self.current_label = ttk.Label(outer, text='读取默认账号…', wraplength=970)
+        self.current_label.pack(anchor='w', pady=(0, 8))
         toolbar = ttk.Frame(outer)
-        toolbar.pack(fill='x', pady=(0, 12))
+        toolbar.pack(fill='x', pady=(0, 6))
         self.auto_value = tk.BooleanVar(value=self.store.settings()['auto_enabled'])
         ttk.Checkbutton(toolbar, text='自动换号', variable=self.auto_value, command=self.toggle_auto).pack(side='left')
         ttk.Button(toolbar, text='选择可用账号', command=self.best_account).pack(side='left', padx=6)
@@ -102,17 +103,42 @@ class App:
         self.auto_label.pack(anchor='w', pady=(0, 8))
         body = ttk.Frame(outer)
         body.pack(fill='both', expand=True)
-        self.canvas = tk.Canvas(body, bg='#f3f5f8', highlightthickness=0, height=620)
-        scroll = ttk.Scrollbar(body, orient='vertical', command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=scroll.set)
+        row_height = tkfont.Font(family='Microsoft YaHei UI', size=10).metrics('linespace') + 8
+        style.configure('Accounts.Treeview', rowheight=row_height, font=('Microsoft YaHei UI', 10), background='white')
+        style.configure('Accounts.Treeview.Heading', font=('Microsoft YaHei UI', 10, 'bold'))
+        columns = [('rank', '#', 35), ('account', '账号', 230), ('five', '五小时', 95),
+                   ('week', '每周', 95), ('state', '状态', 140),
+                   ('next', '下次检查', 145), ('checked', '数据时间', 150)]
+        self.table = ttk.Treeview(body, columns=[c[0] for c in columns], show='headings',
+                                  selectmode='browse', height=12, style='Accounts.Treeview')
+        for key, title, width in columns:
+            self.table.heading(key, text=title)
+            self.table.column(key, width=width, minwidth=width, stretch=key == 'account',
+                              anchor='w' if key == 'account' else 'center')
+        self.table.tag_configure('current', foreground='#25715b', background='#edf7f1')
+        self.table.tag_configure('exhausted', foreground='#b9434d')
+        self.table.tag_configure('unknown', foreground='#657085')
+        self.canvas = self.table  # Shared scrolling entry used by startup/demo.
+        scroll = ttk.Scrollbar(body, orient='vertical', command=self.table.yview)
+        self.table.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
-        self.canvas.pack(side='left', fill='both', expand=True)
-        self.grid = ttk.Frame(self.canvas)
-        self.grid.columnconfigure((0, 1), weight=1, uniform='cards')
-        grid_window = self.canvas.create_window((0, 0), window=self.grid, anchor='nw')
-        self.grid.bind('<Configure>', lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfigure(grid_window, width=e.width))
-        window.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-int(e.delta / 120), 'units'))
+        self.table.pack(side='left', fill='both', expand=True)
+        self.table.bind('<<TreeviewSelect>>', lambda event: self.show_selected())
+        selection = ttk.Frame(outer, padding=(12, 8), style='Card.TFrame')
+        selection.pack(fill='x', pady=(10, 0))
+        self.selected_title = ttk.Label(selection, text='请选择账号', style='Card.TLabel', wraplength=950)
+        self.selected_title.pack(anchor='w')
+        self.selected_details = ttk.Label(selection, text='', style='Card.TLabel', foreground='#657085', wraplength=950)
+        self.selected_details.pack(anchor='w', pady=(3, 5))
+        actions = ttk.Frame(selection, style='Card.TFrame')
+        actions.pack(fill='x')
+        self.switch_button = ttk.Button(actions, text='切换所选账号', command=lambda: self.for_selected(self.switch))
+        self.switch_button.pack(side='left')
+        ttk.Button(actions, text='重新授权', command=lambda: self.for_selected(self.login)).pack(side='left', padx=6)
+        ttk.Button(actions, text='别名', command=lambda: self.for_selected(self.rename_account)).pack(side='left')
+        self.toggle_button = ttk.Button(actions, text='停用轮换', command=lambda: self.for_selected(self.toggle_account))
+        self.toggle_button.pack(side='left', padx=6)
+        ttk.Button(actions, text='移除', command=lambda: self.for_selected(self.remove_account)).pack(side='right')
         self.build_cards()
         self.note = ttk.Label(outer, text='正在读取官方额度…', wraplength=970)
         self.note.pack(anchor='w', pady=(14, 4))
@@ -123,53 +149,72 @@ class App:
         window.geometry(f'{width}x{height}')
         window.minsize(width, height)
         window.after(100, self.poll)
-        window.after(200, self.refresh)
+        window.after(200, lambda: self.refresh(background=True))
         window.after(1000, self.auto_refresh)
         window.after(1000, self.tick)
 
     def build_cards(self):
-        grid = self.grid
-        for child in grid.winfo_children():
-            child.destroy()
-        self.cards = {}
-        self.details = {}
-        for index, slot in enumerate(self.store.slots()):
-            frame = ttk.Frame(grid, style='Card.TFrame', padding=18)
-            frame.grid(row=index//2, column=index%2, sticky='nsew', padx=6, pady=6)
-            meta = self.store.meta(slot)
-            name = ttk.Label(frame, text=meta['alias'] or self.store.identity(slot)['emailAddress'], style='Name.TLabel', wraplength=420)
-            name.pack(anchor='w')
-            if meta['alias']:
-                ttk.Label(frame, text=self.store.identity(slot)['emailAddress'], style='Card.TLabel').pack(anchor='w')
-            state = ttk.Label(frame, text='查询中…', style='Card.TLabel', wraplength=420)
-            state.pack(anchor='w', pady=(5, 8))
-            detail = ttk.Label(frame, text='', style='Card.TLabel', wraplength=420, foreground='#657085')
-            detail.pack(anchor='w')
-            self.details[slot] = detail
-            labels, bars, resets = {}, {}, {}
-            for key, title in [('five_hour', '五小时'), ('seven_day', '每周')]:
-                labels[key] = ttk.Label(frame, text=title + '：—', style='Card.TLabel')
-                labels[key].pack(anchor='w')
-                bars[key] = ttk.Progressbar(frame, maximum=100, style='Blue.Horizontal.TProgressbar')
-                bars[key].pack(fill='x', pady=4)
-                resets[key] = ttk.Label(frame, text='—', style='Card.TLabel', foreground='#657085')
-                resets[key].pack(anchor='w', pady=(0, 8))
-            buttons = ttk.Frame(frame, style='Card.TFrame')
-            buttons.pack(fill='x', side='bottom', pady=(5, 0))
-            switch = ttk.Button(buttons, text='切换为默认账号', command=lambda s=slot: self.switch(s))
-            switch.pack(side='left')
-            ttk.Button(buttons, text='重新授权', command=lambda s=slot: self.login(s)).pack(side='right')
-            management = ttk.Frame(frame, style='Card.TFrame')
-            management.pack(fill='x', pady=(4, 4))
-            ttk.Button(management, text='别名', command=lambda s=slot: self.rename_account(s)).pack(side='left')
-            ttk.Button(management, text='移除', command=lambda s=slot: self.remove_account(s)).pack(side='right')
-            ttk.Button(management, text='停用轮换' if meta['enabled'] else '启用轮换', command=lambda s=slot: self.toggle_account(s)).pack(side='left', padx=6)
-            self.cards[slot] = (state, labels, bars, resets, switch)
+        selected = self.table.selection()
+        for item in self.table.get_children():
+            self.table.delete(item)
+        self.cards = {slot: str(slot) for slot in self.store.slots()}
+        for slot, item in self.cards.items():
+            name = self.store.meta(slot)['alias'] or self.store.identity(slot)['emailAddress']
+            self.table.insert('', 'end', iid=item, values=('', name, '—', '—', '等待数据', '—', '—'))
         for slot, data in self.results.items():
             if slot in self.cards:
                 self.render(data)
+        self.rank_rows()
+        item = selected[0] if selected and self.table.exists(selected[0]) else self.table.get_children()[0] if self.cards else None
+        if item:
+            self.table.selection_set(item)
+        self.show_selected()
 
-    def refresh(self):
+    def for_selected(self, action):
+        selected = self.table.selection()
+        if selected:
+            action(int(selected[0]))
+
+    def rank_rows(self):
+        current = self.store.current()
+        def order(slot):
+            level = self.store.relevant(self.results.get(slot, {}), fresh=False)
+            return (self.store.identity(slot)['accountUuid'] != current,
+                    not self.store.meta(slot)['enabled'], level if level is not None else 101, slot)
+        for index, slot in enumerate(sorted(self.cards, key=order), 1):
+            self.table.move(str(slot), '', index - 1)
+            self.table.set(str(slot), 'rank', index)
+
+    def show_selected(self):
+        selected = self.table.selection()
+        if not selected:
+            self.selected_title.config(text='请选择账号')
+            self.selected_details.config(text='')
+            self.switch_button.state(['disabled'])
+            return
+        slot = int(selected[0])
+        identity = self.store.identity(slot)
+        meta = self.store.meta(slot)
+        current = identity['accountUuid'] == self.store.current()
+        self.selected_title.config(text=(meta['alias'] + ' · ' if meta['alias'] else '') + identity['emailAddress'])
+        self.switch_button.state(['disabled'] if current else ['!disabled'])
+        self.toggle_button.config(text='停用轮换' if meta['enabled'] else '启用轮换')
+        data = self.results.get(slot, {})
+        if data.get('error'):
+            self.selected_details.config(text=data['error'] + '；旧额度不用于选择账号。')
+            return
+        parts = [('五小时' if key == 'five_hour' else '每周') + '：' + reset_text(data['windows'][key].get('resets_at'))
+                 for key in ('five_hour', 'seven_day') if key in data.get('windows', {})]
+        if data.get('auth_expires'):
+            parts.append('授权至 ' + dt.datetime.fromtimestamp(data['auth_expires'] / 1000).strftime('%m/%d'))
+        parts += [f'{w["name"]} 周额度 {w["utilization"]:g}%' for w in data.get('scoped', [])]
+        self.selected_details.config(text=' · '.join(parts) or '尚未取得官方额度数据。')
+
+    def poll_description(self):
+        settings = self.store.settings()
+        return f'官方额度（已用比例） · 当前账号随机 {settings["poll_min_seconds"] / 60:g}–{settings["poll_max_seconds"] / 60:g} 分钟查询 · 备用按重置时间查询'
+
+    def refresh(self, *, background=False):
         if self.exit_requested or self.refreshing:
             return
         if time.time() - self.last_refresh < 30:
@@ -179,11 +224,11 @@ class App:
         self.refreshing = True
         self.last_refresh = time.time()
         self.refresh_button.state(['disabled'])
-        self.note.config(text=f'正在向官方查询 {len(slots)} 个账号的额度…')
+        self.note.config(text='正在检查额度；未到重置时间的耗尽账号使用缓存…')
         def work():
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                    tasks = {pool.submit(self.store.quota, s): s for s in slots}
+                    tasks = {pool.submit(self.store.quota, s, background=background): s for s in slots}
                     for task in concurrent.futures.as_completed(tasks):
                         slot = tasks[task]
                         try:
@@ -224,42 +269,34 @@ class App:
     def render(self, data):
         slot = data['slot']
         self.results[slot] = data
-        state, labels, bars, resets, switch = self.cards[slot]
+        if slot not in self.cards:
+            return
         current = self.store.identity(slot)['accountUuid'] == self.store.current()
         if current:
             self.current_label.config(text='默认账号：' + self.store.identity(slot)['emailAddress'] + '  ·  CC Switch 官方用量读取此账号')
-        switch.state(['disabled'] if current else ['!disabled'])
+        meta = self.store.meta(slot)
+        name = meta['alias'] or self.store.identity(slot)['emailAddress']
         if data.get('error'):
-            self.details[slot].config(text='需要重新授权' if data.get('reauth_required') else '暂时错误，按冷却时间自动重试')
-            state.config(text=data['error'], foreground='#b9434d', wraplength=420)
-            for key in labels:
-                labels[key].config(text=('五小时' if key == 'five_hour' else '每周') + '：未知')
-                bars[key]['value'] = 0
-                previous = data.get('last_good') or {}
-                prior = previous.get('windows', {}).get(key, {}).get('utilization')
-                resets[key].config(text=f'上次成功查询：已用 {prior:g}%（旧数据，不用于自动切换）' if isinstance(prior, (int, float)) else '本次查询未成功，不代表额度为零')
-            return
-        exhausted = any(w.get('utilization', 0) >= 100 for w in data['windows'].values())
-        scoped_text = '；'.join(f'{w["name"]} 周额度 {w["utilization"]:g}%' for w in data.get('scoped', []))
-        checked_text = dt.datetime.fromtimestamp(data['checked']).strftime('%H:%M:%S') if data.get('checked') else '未知'
-        self.details[slot].config(text='数据时间 ' + checked_text + ('（缓存）' if data.get('cached') else '') + ('\n' + scoped_text if scoped_text else ''))
-        extra = ''
-        expiry = data.get('auth_expires')
-        if expiry:
-            extra = ' · 授权至 ' + dt.datetime.fromtimestamp(expiry / 1000).strftime('%m/%d')
-        if not self.store.meta(slot)['enabled']:
-            extra += ' · 不参与自动轮换'
-        state.config(text=('默认账号 · ' if current else '') + ('额度已耗尽' if exhausted else '有可用额度') + ' · MAX' + extra,
-                     foreground='#b9434d' if exhausted else '#25715b')
-        for key, label in labels.items():
-            value = data['windows'][key].get('utilization')
-            if not isinstance(value, (int, float)):
-                label.config(text=('五小时' if key == 'five_hour' else '每周') + '：未知')
-                continue
-            label.config(text=f'{"五小时" if key == "five_hour" else "每周"}：已用 {value:g}% · 剩余 {max(0,100-value):g}%')
-            bars[key]['value'] = value
-            bars[key].config(style=('Red' if value >= 100 else 'Blue') + '.Horizontal.TProgressbar')
-            resets[key].config(text=reset_text(data['windows'][key].get('resets_at')))
+            state = '需重新授权' if data.get('reauth_required') else '查询错误'
+            five, week, tag = '未知', '未知', 'unknown'
+        else:
+            values = [data['windows'].get(key, {}).get('utilization') for key in ('five_hour', 'seven_day')]
+            five, week = [f'{value:g}%' if isinstance(value, (int, float)) else '未知' for value in values]
+            level = self.store.relevant(data, fresh=False)
+            exhausted = level is not None and level >= 100
+            state = '已耗尽' if exhausted else '使用中' if current else '备用缓存'
+            tag = 'exhausted' if exhausted else 'current' if current else 'unknown' if level is None else ''
+        checked_text = dt.datetime.fromtimestamp(data['checked']).strftime('%m/%d %H:%M') if data.get('checked') else '未知'
+        deadline = self.store.refresh_deadline(data, active=current)
+        blocked = self.store.blocked_until(data)
+        if blocked:
+            state = '当前 · 待重置' if current else '等待重置'
+        if not meta['enabled']:
+            state += ' · 停用轮换'
+        next_text = dt.datetime.fromtimestamp(deadline).strftime('%m/%d %H:%M') if deadline else '需要时校验'
+        self.table.item(str(slot), values=('', name, five, week, state, next_text, checked_text), tags=(tag,))
+        self.rank_rows()
+        self.show_selected()
 
     def poll(self):
         # Arm before processing: a malformed row or disk error cannot kill the loop.
@@ -288,12 +325,12 @@ class App:
                     self.refresh_button.state(['!disabled'])
                     ok = sum(not d.get('error') for d in self.results.values())
                     fresh = sum(not d.get('cached') and not d.get('error') for d in self.results.values())
-                    self.note.config(text=f'检查完成 {dt.datetime.now():%H:%M:%S} · {ok}/{len(self.cards)} 个账号有有效数据，本轮 {fresh} 个获得新额度 · 实际数据时间见卡片')
+                    self.note.config(text=f'检查完成 {dt.datetime.now():%H:%M:%S} · {ok}/{len(self.cards)} 个账号有额度记录，本轮 {fresh} 个获得新额度 · 数据时间见列表')
                     if self.initial_view:
                         self.canvas.yview_moveto(0)
                         self.initial_view = False
                     if self.auto_value.get() and not self.login_process and not self.exit_requested:
-                        self.run_job(lambda: self.store.auto_step(list(self.results.values())), 'auto')
+                        self.run_job(self.check_rotation, 'auto')
                     write(self.store.root / 'last-status.json', {'checked': dt.datetime.now().astimezone().isoformat(), 'accounts': list(self.results.values())})
                     self.store.log('quota_cycle', reason=f'fresh={fresh}; valid={ok}; total={len(self.cards)}')
                 elif kind == 'job':
@@ -307,7 +344,7 @@ class App:
                         self.auto_label.config(text=str(result))
                         if label == 'switch':
                             self.last_refresh = 0
-                            self.refresh()
+                            self.refresh(background=True)
                 elif kind == 'enrolled':
                     path, exitcode = value
                     self.login_process = None
@@ -335,14 +372,14 @@ class App:
                             if read(config_path)['oauthAccount']['accountUuid'] != expected:
                                 write(config_path, config_data)
                                 write(credential_path, credential_data)
-                                messagebox.showerror('账号不一致', '登录了另一个账号，已恢复原账号配置。请重新授权并选择卡片上的账号。')
+                                messagebox.showerror('账号不一致', '登录了另一个账号，已恢复原账号配置。请重新授权并选择列表中的账号。')
                         except (OSError, KeyError, ValueError):
                             write(config_path, config_data)
                             write(credential_path, credential_data)
                             messagebox.showerror('授权未完成', '未获取有效登录身份，已恢复原账号配置。')
                     self.last_refresh = 0
                     self.store.invalidate(value)
-                    self.refresh()
+                    self.refresh(background=True)
         except queue.Empty:
             pass
         if self.exit_requested and not (self.working or self.refreshing or self.login_process):
@@ -359,15 +396,22 @@ class App:
         self.window.after(1000, self.auto_refresh)
         if self.refreshing or self.working or self.login_process or time.time() - self.last_refresh < 30:
             return
-        if any(self.results.get(slot, {}).get('next_poll', 0) <= time.time() for slot in self.cards):
-            self.refresh()
+        current = self.store.current()
+        for slot in self.cards:
+            active = self.store.identity(slot)['accountUuid'] == current
+            if not active and not self.store.meta(slot)['enabled']:
+                continue
+            deadline = self.store.refresh_deadline(self.results.get(slot, {}), active=active)
+            if deadline is not None and deadline <= time.time():
+                self.refresh(background=True)
+                break
 
     def refresh_after_enrollment(self):
         if self.refreshing:
             self.window.after(200, self.refresh_after_enrollment)
         else:
             self.last_refresh = 0
-            self.refresh()
+            self.refresh(background=True)
 
     def close(self):
         if not self.tray.hwnd or not self.tray.thread.is_alive():
@@ -417,14 +461,29 @@ class App:
         self.store.save_settings({'auto_enabled': self.auto_value.get()})
         self.auto_label.config(text='自动模式已开启；关闭窗口后在托盘继续监控' if self.auto_value.get() else '自动模式已关闭；托盘右键可退出')
         if self.auto_value.get():
-            self.run_job(lambda: self.store.auto_step(list(self.results.values())), 'auto')
+            self.run_job(self.check_rotation, 'auto')
+
+    def check_rotation(self):
+        rows = list(self.results.values())
+        try:
+            return self.store.auto_step(rows)
+        finally:
+            for row in rows:
+                self.events.put(('quota', row))
 
     def best_account(self):
-        target = self.store.choose(list(self.results.values()))
-        if target is None:
-            messagebox.showinfo('暂无可用账号', '当前没有查询成功、已启用且低于切换阈值的账号。等待额度恢复后再试。')
+        if runner_active():
+            messagebox.showinfo('受管任务运行中', '请先停止受管任务，再手动选择账号。')
             return
-        self.switch(target)
+        def work():
+            rows = self.store.validate_candidates(list(self.results.values()))
+            for row in rows:
+                self.events.put(('quota', row))
+            target = self.store.choose(rows)
+            if target is None:
+                raise RuntimeError('暂无查询成功、已启用且低于切换阈值的账号；未重置的耗尽账号不会重复查询。')
+            return self.store.switch(target, allow_running=True)
+        self.run_job(work, 'switch')
 
     def rename_account(self, slot):
         alias = simpledialog.askstring('账号别名', '输入便于辨认的名称（留空恢复显示邮箱）：', initialvalue=self.store.meta(slot)['alias'])
@@ -453,7 +512,7 @@ class App:
             self.store.restore_removed()
             self.build_cards()
             self.last_refresh = 0
-            self.refresh()
+            self.refresh(background=True)
         except Exception as exc:
             messagebox.showinfo('未恢复', str(exc))
 
@@ -466,22 +525,23 @@ class App:
         current = self.store.settings()
         fields = {}
         for row, (key, label) in enumerate([('threshold', '自动切换阈值（50–100%）'),
-                ('poll_seconds', '查询间隔（180–3600秒）'), ('cooldown', '切换冷却（60–3600秒）'),
+                ('poll_min_seconds', '最短随机间隔（秒，默认300）'),
+                ('poll_max_seconds', '最长随机间隔（秒，默认480）'), ('cooldown', '切换冷却（60–3600秒）'),
                 ('model', '额外检查的模型周限额（可留空）')]):
             ttk.Label(body, text=label).grid(row=row, column=0, sticky='w', pady=6)
             value = tk.StringVar(value=str(current[key]))
             ttk.Entry(body, textvariable=value, width=24).grid(row=row, column=1, padx=12)
             fields[key] = value
-        ttk.Label(body, text='访问令牌按需自动刷新；刷新授权失效时提示重新登录。\n已验证 Windows Claude 2.1.288 运行中切换，后续请求生效。\n已经发出的请求不变；受管任务可在额度中断后换号接续。', wraplength=520).grid(row=4, column=0, columnspan=2, pady=12)
+        ttk.Label(body, text='仅当前账号定期查询；备用账号在重置或换号前校验。\n额度耗尽且未到官方重置时间时不查询。\n访问令牌按需刷新，授权失效时提示重新登录。', wraplength=520).grid(row=5, column=0, columnspan=2, pady=12)
         def save():
             try:
                 values = {k: (v.get().strip() if k == 'model' else int(v.get())) for k, v in fields.items()}
                 self.store.save_settings(values)
-                self.subtitle.config(text=f'官方额度 · 每 {values["poll_seconds"]} 秒查询 · 时间按 Windows 本地时区显示')
+                self.subtitle.config(text=self.poll_description())
                 dialog.destroy()
             except ValueError as exc:
                 messagebox.showerror('设置无效', str(exc))
-        ttk.Button(body, text='保存', command=save).grid(row=5, column=1, sticky='e')
+        ttk.Button(body, text='保存', command=save).grid(row=6, column=1, sticky='e')
 
     def show_logs(self):
         dialog = tk.Toplevel(self.window)

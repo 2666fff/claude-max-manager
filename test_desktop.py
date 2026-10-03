@@ -2,6 +2,8 @@
 import time
 import io
 import json
+import datetime as dt
+import gc
 import tkinter as tk
 import unittest
 import uuid
@@ -20,7 +22,7 @@ class DesktopTests(unittest.TestCase):
         self.fixture = test_features.ContractTests()
         self.fixture.setUp()
         self.store_patch = patch('manager.Store', return_value=self.fixture.store)
-        self.refresh_patch = patch.object(App, 'refresh', lambda _: None)
+        self.refresh_patch = patch.object(App, 'refresh', lambda _, **kwargs: None)
         self.store_patch.start()
         self.refresh_patch.start()
         self.window = tk.Tk()
@@ -45,11 +47,17 @@ class DesktopTests(unittest.TestCase):
 
     def tearDown(self):
         if self.exists():
-            self.window.destroy()
+            self.app.exit_app()
+            self.pump(lambda: not self.exists())
         self.app.tray.close()
         self.refresh_patch.stop()
         self.store_patch.stop()
         self.fixture.tearDown()
+        # Each test creates a Tcl interpreter. Release its cycles here on the
+        # UI thread, before a later worker allocation can trigger Python GC.
+        self.app = None
+        self.window = None
+        gc.collect()
 
     def test_close_minimize_and_tray_restore(self):
         self.app.close()
@@ -101,14 +109,14 @@ class DesktopTests(unittest.TestCase):
             clock[0] = now + 331
             self.pump(lambda: switch.called)
             self.pump(lambda: not self.app.working)
-            self.assertEqual(sorted(calls), [1, 2, 5])
+            self.assertEqual(calls, [1])  # Standby accounts remain cached.
             switch.assert_called_once_with(2, allow_running=True)
             self.assertEqual(self.window.state(), 'withdrawn')
             saved = read(self.fixture.store.root / 'last-status.json')
             self.assertEqual(next(r for r in saved['accounts'] if r['slot'] == 1)['windows']['five_hour']['utilization'], 100)
             # Next genuine deadline also triggers, proving recurrence.
-            clock[0] = now + 632
-            self.pump(lambda: len(calls) == 6 and not self.app.refreshing and not self.app.working)
+            clock[0] = now + 812
+            self.pump(lambda: len(calls) >= 2 and not self.app.refreshing and not self.app.working)
 
     def test_callback_error_does_not_strand_done_event(self):
         self.app.refreshing = True
@@ -121,6 +129,22 @@ class DesktopTests(unittest.TestCase):
         self.assertIn('monitor_error', log)
         self.assertNotIn('synthetic private content', log)
 
+    def test_vertical_rows_rank_current_first_and_actions_use_selection(self):
+        for row in [self.fixture.row(1, 70, 20), self.fixture.row(2, 10, 20), self.fixture.row(5, 100, 20)]:
+            self.app.render(row)
+        self.assertEqual(self.app.table.get_children(), ('1', '2', '5'))
+        self.app.table.selection_set('2')
+        self.app.show_selected()
+        self.assertIn('account-2@example.invalid', self.app.selected_title.cget('text'))
+        with patch.object(self.app, 'switch') as switch:
+            self.app.switch_button.invoke()
+            switch.assert_called_once_with(2)
+        self.fixture.store.set_meta(2, alias='备用 Max')
+        self.app.build_cards()
+        self.assertEqual(self.app.table.selection(), ('2',))
+        self.assertEqual(self.app.table.set('2', 'account'), '备用 Max')
+        self.assertFalse(self.app.switch_button.instate(['disabled']))
+
     def test_worker_setup_failure_finishes_refresh(self):
         self.refresh_patch.stop()
         with patch('manager.concurrent.futures.ThreadPoolExecutor', side_effect=RuntimeError('fixture')):
@@ -128,6 +152,34 @@ class DesktopTests(unittest.TestCase):
             self.pump(lambda: not self.app.refreshing)
         self.assertTrue(all(row.get('error') for row in self.app.results.values()))
         self.assertFalse(self.app.refresh_button.instate(['disabled']))
+
+    def test_standby_reset_wakes_hidden_scheduler_without_polling_other_accounts(self):
+        self.refresh_patch.stop()
+        now = time.time()
+        clock = [now]
+        calls = []
+        def response(request, **kwargs):
+            calls.append(int(request.get_header('Authorization').rsplit('-', 1)[1]))
+            return io.BytesIO(json.dumps({'five_hour': {'utilization': 10}, 'seven_day': {'utilization': 20}}).encode())
+        with patch('manager.time.time', side_effect=lambda: clock[0]), \
+             patch('enhanced.urllib.request.urlopen', side_effect=response):
+            for slot in self.fixture.store.slots():
+                row = self.fixture.row(slot, five=100 if slot == 5 else 10)
+                row['next_poll'] = now + 300 if slot == 1 else now - 1
+                seconds = 60 if slot == 2 else 900
+                row['windows']['five_hour']['resets_at'] = dt.datetime.fromtimestamp(now + seconds, dt.timezone.utc).isoformat()
+                write(self.fixture.store.profile(slot) / 'usage-cache.json', row)
+                self.app.render(row)
+            self.app.last_refresh = now
+            self.app.close()
+            clock[0] = now + 61
+            self.pump(lambda: calls == [2] and not self.app.refreshing and not self.app.working)
+            self.assertEqual(self.window.state(), 'withdrawn')
+            clock[0] = now + 120
+            observed = []
+            self.window.after(1100, lambda: observed.append(True))
+            self.pump(lambda: bool(observed))
+            self.assertEqual(calls, [2])
 
     def test_deadline_check_survives_exception_and_respects_backoff(self):
         now = time.time()

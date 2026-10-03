@@ -91,7 +91,7 @@ class Store:
         for slot in self.slots():
             saved = self.identity(slot)
             if saved['accountUuid'] == identity['accountUuid'] or saved['emailAddress'].casefold() == identity['emailAddress'].casefold():
-                raise RuntimeError('这个账号已经在列表中，未重复添加。需要更新授权时请点击原卡片的“重新授权”。')
+                raise RuntimeError('这个账号已经在列表中，未重复添加。需要更新授权时请选中该账号，再点击“重新授权”。')
         slot = max(self.slots(), default=0) + 1
         target = self.profile(slot)
         if target.exists() or target.resolve().parent != self.root.resolve():

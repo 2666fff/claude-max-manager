@@ -22,7 +22,7 @@ def main():
         base = Path(temporary)
         live = base / 'live'
         root = base / 'accounts'
-        for slot in [1, 2]:
+        for slot in range(1, 13):
             identity = {'accountUuid': f'demo-account-{slot}',
                         'emailAddress': f'account-{slot}@example.invalid'}
             write(root / f'max-{slot}' / '.claude.json', {'oauthAccount': identity})
@@ -31,17 +31,19 @@ def main():
             if slot == 1:
                 write(live / '.claude.json', {'oauthAccount': identity})
         store = Store(root, live, live / '.claude.json', process_check=lambda: [])
-        with patch('manager.Store', return_value=store), patch.object(App, 'refresh', lambda _: None), \
+        with patch('manager.Store', return_value=store), patch.object(App, 'refresh', lambda _, **kwargs: None), \
                 patch('urllib.request.urlopen', side_effect=RuntimeError('Demo is strictly offline')):
             window = tk.Tk()
             app = App(window)
             window.title('Claude Max Manager — 离线演示 / 虚构数据')
             app.subtitle.config(text='离线界面演示 · 所有账号、额度与时间均为虚构数据')
             now = time.time()
-            for slot, five, week in [(1, 100, 65), (2, 12, 28)]:
+            for slot in range(1, 13):
+                five = 100 if slot in (1, 10) else (slot - 1) * 7
+                week = 100 if slot in (5, 12) else (slot - 1) * 5
                 def reset(hours):
                     return dt.datetime.fromtimestamp(now + hours * 3600, dt.timezone.utc).isoformat()
-                app.render({'slot': slot, 'plan': 'max', 'checked': now,
+                app.render({'slot': slot, 'plan': 'max', 'checked': now if slot == 1 else now - 3600, 'cached': slot != 1,
                     'auth_expires': (now + 30 * 86400) * 1000,
                     'scoped': [{'name': 'Opus', 'utilization': week}],
                     'windows': {'five_hour': {'utilization': five, 'resets_at': reset(2)},
@@ -60,18 +62,19 @@ def main():
             deadline = time.monotonic() + 30
             def capture_done():
                 if capture.poll() is not None:
-                    window.quit()
+                    window.after_idle(window.destroy)
                 elif time.monotonic() > deadline:
                     capture.kill()
                     capture.wait()
-                    window.quit()
+                    window.after_idle(window.destroy)
                 else:
                     window.after(30, capture_done)
             window.after(30, capture_done)
             window.mainloop()
             if capture.returncode:
                 raise RuntimeError('Demo window capture failed')
-            window.destroy()
+            if not app.window_destroyed:
+                window.destroy()
             print('Saved synthetic-data UI screenshot:', output.relative_to(PROJECT))
 
 

@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -97,7 +98,7 @@ def require_live_switch_support():
 
 class Store(BasicStore):
     DEFAULTS = {'auto_enabled': True, 'threshold': 99, 'cooldown': 300,
-                'poll_seconds': 300, 'model': '', 'min_improvement': 5}
+                'poll_min_seconds': 300, 'poll_max_seconds': 480, 'model': '', 'min_improvement': 5}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -105,14 +106,16 @@ class Store(BasicStore):
 
     def settings(self):
         path = self.root / 'settings.json'
-        return {**self.DEFAULTS, **(read(path) if path.exists() else {})}
+        settings = {**self.DEFAULTS, **(read(path) if path.exists() else {})}
+        settings.pop('poll_seconds', None)  # Replaced by the requested random range.
+        return settings
 
     def save_settings(self, data):
         updated = {**self.settings(), **data}
         if not 50 <= int(updated['threshold']) <= 100:
             raise ValueError('切换阈值应为50–100%。')
-        if not 180 <= int(updated['poll_seconds']) <= 3600:
-            raise ValueError('查询间隔应为180–3600秒。')
+        if not 180 <= int(updated['poll_min_seconds']) <= int(updated['poll_max_seconds']) <= 3600:
+            raise ValueError('随机查询间隔应满足180 ≤ 最短 ≤ 最长 ≤ 3600秒。')
         if not 60 <= int(updated['cooldown']) <= 3600:
             raise ValueError('切换冷却应为60–3600秒。')
         write(self.root / 'settings.json', updated)
@@ -262,14 +265,66 @@ class Store(BasicStore):
                 self.log('token_refreshed', slot=slot)
                 return fresh
 
-    def quota(self, slot):
+    def selected_windows(self, row):
+        windows = row.get('windows', {})
+        selected = [windows[k] for k in ('five_hour', 'seven_day') if k in windows]
+        model = self.settings()['model'].strip().casefold()
+        if model:
+            selected += [w for w in row.get('scoped', []) if w['name'].casefold() == model]
+            selected += [w for key, w in windows.items() if key.casefold() == 'seven_day_' + model]
+        return selected
+
+    @staticmethod
+    def reset_timestamp(window):
+        value = window.get('resets_at')
+        if not value:
+            return None
+        try:
+            when = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+            # An offset is required; do not guess the API timestamp's timezone.
+            return when.timestamp() if when.tzinfo is not None else None
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            return None
+
+    def blocked_until(self, row):
+        if row.get('error'):
+            return None
+        # Any selected, exhausted window blocks use. Wait for the last blocker.
+        times = [self.reset_timestamp(w) for w in self.selected_windows(row)
+                 if isinstance(w.get('utilization'), (int, float)) and w['utilization'] >= 100]
+        future = [t for t in times if t is not None and t > time.time()]
+        return max(future) if future else None
+
+    def refresh_deadline(self, row, *, active):
+        if not row:
+            return 0  # First observation is needed to learn the official limits.
+        retry = row.get('next_poll', 0)
+        blocked = self.blocked_until(row)
+        if blocked:
+            return max(blocked, retry)
+        if active:
+            return retry
+        if row.get('error'):
+            return None  # Standby errors are retried when a candidate is needed.
+        resets = [t for w in self.selected_windows(row)
+                  if (t := self.reset_timestamp(w)) is not None and t > row.get('checked', 0)]
+        return max(min(resets), retry) if resets else None
+
+    def quota(self, slot, *, background=False):
         identity = self.identity(slot)
         base = {'slot': slot, 'email': identity['emailAddress'], 'current': identity['accountUuid'] == self.current(),
                 'plan': 'max', 'meta': {key: self.meta(slot)[key] for key in ('alias', 'enabled')}}
         cache_path = self.profile(slot) / 'usage-cache.json'
         cache = read(cache_path) if cache_path.exists() else {}
+        blocked = self.blocked_until(cache)
+        if blocked:
+            return {**cache, **base, 'cached': True, 'query_policy': 'waiting_reset'}
         if cache.get('next_poll', 0) > time.time():
             return {**cache, **base, 'cached': True}
+        if background and cache and not base['current']:
+            deadline = self.refresh_deadline(cache, active=False)
+            if not base['meta']['enabled'] or deadline is None or deadline > time.time():
+                return {**cache, **base, 'cached': True, 'query_policy': 'standby'}
         try:
             token = self.token(slot, force=bool(cache.get('refresh_on_retry')))
             base['auth_expires'] = token.get('refreshTokenExpiresAt')
@@ -288,8 +343,10 @@ class Store(BasicStore):
                 model = (limit.get('scope') or {}).get('model') or {}
                 if model.get('display_name') and isinstance(limit.get('percent'), (float, int)):
                     scoped.append({'name': model['display_name'], 'utilization': limit['percent'], 'resets_at': limit.get('resets_at')})
-            result = {**base, 'windows': windows, 'scoped': scoped, 'checked': time.time(),
-                      'next_poll': time.time() + self.settings()['poll_seconds'], 'failures': 0}
+            settings = self.settings()
+            checked = time.time()
+            result = {**base, 'windows': windows, 'scoped': scoped, 'checked': checked,
+                      'next_poll': checked + random.randint(settings['poll_min_seconds'], settings['poll_max_seconds']), 'failures': 0}
         except (AuthProblem, urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, RuntimeError) as exc:
             failures = cache.get('failures', 0) + 1
             delay = min(1800, 180 * 2 ** min(failures - 1, 4))
@@ -314,21 +371,25 @@ class Store(BasicStore):
     def invalidate(self, slot):
         (self.profile(slot) / 'usage-cache.json').unlink(missing_ok=True)
 
-    def relevant(self, row):
-        if row.get('error') or not row.get('checked') or time.time() - row['checked'] > 600:
+    def relevant(self, row, *, fresh=True):
+        if row.get('error') or not row.get('checked') or (fresh and time.time() - row['checked'] > 600):
             return None
         windows = row.get('windows', {})
         if not all(k in windows for k in ['five_hour', 'seven_day']):
             return None
-        selected = [windows['five_hour'], windows['seven_day']]
-        model = self.settings()['model'].strip().casefold()
-        if model:
-            selected += [w for w in row.get('scoped', []) if w['name'].casefold() == model]
-            selected += [w for key, w in windows.items() if key.casefold() == 'seven_day_' + model]
-        values = [w.get('utilization') for w in selected]
+        values = [w.get('utilization') for w in self.selected_windows(row)]
         if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) for v in values):
             return None
         return max(values)
+
+    def validate_candidates(self, rows, exclude=()):
+        checked = []
+        for row in rows:
+            slot = row['slot']
+            if slot not in exclude and self.meta(slot)['enabled'] and self.relevant(row) is None:
+                row = self.quota(slot)  # Cache/backoff/exhausted-until-reset still apply.
+            checked.append(row)
+        return checked
 
     def choose(self, rows, exclude=()):
         usable = []
@@ -362,9 +423,11 @@ class Store(BasicStore):
         if runner_active():
             return '受管任务正在管理账号选择，桌面自动模式等待'
         current = next((r for r in rows if self.identity(r['slot'])['accountUuid'] == self.current()), None)
-        if not current or self.relevant(current) is None:
+        current_level = self.relevant(current) if current else None
+        if current and current_level is None and self.blocked_until(current):
+            current_level = self.relevant(current, fresh=False)
+        if current_level is None:
             return '当前额度未知，等待有效查询结果'
-        current_level = self.relevant(current)
         if current_level < settings['threshold']:
             return '自动监控中，当前账号尚未达到切换阈值'
         # Near exhaustion, usable alternatives must not be blocked by hysteresis.
@@ -372,6 +435,7 @@ class Store(BasicStore):
         rotation = self.root / 'rotation.json'
         if not urgent and rotation.exists() and time.time() - read(rotation)['last_switch'] < settings['cooldown']:
             return '切换冷却中，避免账号来回切换'
+        rows[:] = self.validate_candidates(rows, exclude=[current['slot']])
         target = self.choose(rows, exclude=[current['slot']])
         if target is None:
             return '没有额度充足且启用的备用账号，等待额度恢复'
