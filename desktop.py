@@ -47,6 +47,8 @@ def signature(dll, name, result, *args):
 
 
 signature(kernel, 'GetModuleHandleW', w.HMODULE, w.LPCWSTR)
+signature(kernel, 'GetCurrentProcess', w.HANDLE)
+signature(kernel, 'IsProcessInJob', w.BOOL, w.HANDLE, w.HANDLE, c.POINTER(w.BOOL))
 signature(user, 'RegisterClassW', w.ATOM, c.POINTER(WNDCLASS))
 signature(user, 'UnregisterClassW', w.BOOL, w.LPCWSTR, w.HINSTANCE)
 signature(user, 'CreateWindowExW', w.HWND, w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
@@ -74,6 +76,45 @@ signature(shell, 'Shell_NotifyIconW', w.BOOL, w.DWORD, c.POINTER(ICONDATA))
 def restore_existing():
     hwnd = user.FindWindowW(TRAY_CLASS, TRAY_TITLE)
     return bool(hwnd and user.PostMessageW(hwnd, RESTORE, 0, 0))
+
+
+def process_in_job():
+    result = w.BOOL()
+    if not kernel.IsProcessInJob(kernel.GetCurrentProcess(), None, c.byref(result)):
+        raise c.WinError(c.get_last_error())
+    return bool(result.value)
+
+
+def launch_independent(script, arguments=()):
+    """Use the existing desktop's automation object to escape *all* host jobs.
+
+    CREATE_BREAKAWAY_FROM_JOB can leave a process inside an outer nested job.
+    Shell.Application.ShellExecute alone can also execute in the caller; obtain
+    the desktop's out-of-process Document.Application explicitly.
+    """
+    python = Path(sys.executable).with_name('pythonw.exe')
+    if not python.is_file():
+        raise RuntimeError('未找到 pythonw.exe，无法独立启动。')
+    script = Path(script).resolve(strict=True)
+    env = os.environ.copy()
+    env['CCM_LAUNCH_EXE'] = str(python)
+    env['CCM_LAUNCH_ARGS'] = subprocess.list2cmdline([str(script), *arguments])
+    env['CCM_LAUNCH_CWD'] = str(script.parent)
+    code = '''
+$ErrorActionPreference = 'Stop'
+$hwnd = 0
+$shell = New-Object -ComObject Shell.Application
+$desktop = $shell.Windows().FindWindowSW(0, 0, 8, [ref]$hwnd, 1)
+if ($null -eq $desktop) { throw 'Windows desktop shell is unavailable' }
+$desktop.Document.Application.ShellExecute($env:CCM_LAUNCH_EXE, $env:CCM_LAUNCH_ARGS,
+    $env:CCM_LAUNCH_CWD, 'open', 0)
+'''
+    encoded = base64.b64encode(code.encode('utf-16le')).decode('ascii')
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-EncodedCommand', encoded],
+                            env=env, capture_output=True, timeout=20,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:
+        raise RuntimeError('Windows 桌面独立启动失败，请从桌面快捷方式打开程序。')
 
 
 class Tray:

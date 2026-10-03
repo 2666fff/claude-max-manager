@@ -23,6 +23,7 @@ usage-cache.json
 events*.jsonl
 runner.json
 runner.stop
+manager-runtime.json
 task-*.txt
 *.log
 *.tmp

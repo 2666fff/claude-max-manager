@@ -1,5 +1,6 @@
 """Local Max quota viewer and guarded default-account switcher. No gateway."""
 import concurrent.futures
+import argparse
 import ctypes
 import datetime as dt
 import json
@@ -24,7 +25,8 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 from core import read, write, running_claude
 from enhanced import Store, runner_active
-from desktop import Tray, create_shortcut, restore_existing
+from desktop import Tray, create_shortcut, restore_existing, process_in_job, launch_independent
+from lifecycle import Lifecycle, InstanceMutex
 
 
 def reset_text(value):
@@ -37,9 +39,11 @@ def reset_text(value):
 
 
 class App:
-    def __init__(self, window):
+    def __init__(self, window, lifecycle=None, store=None):
         self.window = window
-        self.store = Store()
+        self.window_destroyed = False
+        self.lifecycle = lifecycle
+        self.store = store if store is not None else Store()
         self.store.recover()
         self.store.init_first()
         self.results = {}
@@ -205,11 +209,14 @@ class App:
         self.note.config(text=f'监控回调异常：{kind.__name__}；后续定时检查继续运行。')
         try:
             self.store.log('monitor_error', reason=kind.__name__)
+            if self.lifecycle:
+                self.lifecycle.error('ui', kind, traceback)
         except Exception as exc:
             self.note.config(text=f'监控异常：{kind.__name__}；日志写入失败：{type(exc).__name__}。请检查本地文件。')
 
     def destroyed(self, event):
         if event.widget is self.window:
+            self.window_destroyed = True
             for timer in self.window.tk.call('after', 'info'):
                 self.window.after_cancel(timer)
             self.tray.close()
@@ -268,6 +275,8 @@ class App:
                 elif kind == 'tray_error':
                     self.show_window()
                     messagebox.showerror('托盘异常', value)
+                elif kind == 'background_error':
+                    self.note.config(text='后台线程异常：' + value + '；详情见本地运行诊断。')
                 elif kind == 'quota':
                     try:
                         self.render(value)
@@ -398,6 +407,8 @@ class App:
     def tick(self):
         if self.window.winfo_exists():
             self.window.after(30000, self.tick)
+            if self.lifecycle:
+                self.lifecycle.pulse()
             for slot, data in list(self.results.items()):
                 if slot in self.cards:
                     self.render(data)
@@ -480,6 +491,13 @@ class App:
         box.pack(fill='both', expand=True)
         path = self.store.root / 'events.jsonl'
         box.insert('end', '\n'.join(path.read_text(encoding='utf-8').splitlines()[-200:]) if path.exists() else '暂无操作记录。')
+        runtime = self.store.root / 'manager-runtime.json'
+        if runtime.exists():
+            box.insert('end', '\n\n运行诊断：\n' + json.dumps(read(runtime), ensure_ascii=False, indent=2))
+        for name in ('manager-fault.log', 'manager-fault.previous.log'):
+            fault = self.store.root / name
+            if fault.exists() and fault.stat().st_size:
+                box.insert('end', '\n\n' + name + '：\n' + fault.read_text(encoding='utf-8', errors='replace')[-16000:])
         box.configure(state='disabled')
 
     def managed_dialog(self):
@@ -630,28 +648,69 @@ class App:
         threading.Thread(target=lambda: (proc.wait(), self.events.put(('login', slot))), daemon=True).start()
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Claude Max 账号与额度')
+    parser.add_argument('--desktop-launch', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--cli-executable', help=argparse.SUPPRESS)
+    options = parser.parse_args(argv)
+    if options.cli_executable:
+        accounts.CLI = Path(options.cli_executable).expanduser().resolve(strict=True)
+    # Running from an IDE/tool job can terminate the UI when that host finishes.
+    # Restoring the user's existing instance must not start a second instance.
+    if restore_existing():
+        return
+    if process_in_job():
+        if options.desktop_launch:
+            raise RuntimeError('独立启动仍受宿主进程管理，请从 Windows 桌面快捷方式打开。')
+        args = ['--desktop-launch']
+        override = options.cli_executable or os.environ.get('CLAUDE_CODE_EXECUTABLE')
+        if override:
+            args += ['--cli-executable', override]
+        launch_independent(HERE / 'manager.py', args)
+        return
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    # Prevent concurrent account switches from multiple application windows.
-    kernel = ctypes.windll.kernel32
-    kernel.CreateMutexW.restype = ctypes.c_void_p
-    mutex = kernel.CreateMutexW(None, False, 'Local\\ClaudeMaxManager')
-    if kernel.GetLastError() == 183:
-        if not restore_existing():
-            ctypes.windll.user32.MessageBoxW(0, '账号工具已经打开，请查看任务栏或系统托盘。', 'Claude Max', 0)
-        return
-    window = tk.Tk()
+    mutex = InstanceMutex()
+    lifecycle = None
+    window = None
+    app = None
+    old_thread_hook = threading.excepthook
     try:
-        App(window)
+        if mutex.existing:
+            if not restore_existing():
+                ctypes.windll.user32.MessageBoxW(0, '账号工具正在启动，请稍后查看系统托盘。', 'Claude Max', 0)
+            return
+        store = Store()
+        lifecycle = Lifecycle(store.root, store.log)
+        window = tk.Tk()
+        app = App(window, lifecycle, store)
+        def thread_error(args):
+            lifecycle.error('thread', args.exc_type, args.exc_traceback)
+            app.events.put(('background_error', args.exc_type.__name__))
+        threading.excepthook = thread_error
+        window.mainloop()
+        lifecycle.finish('clean' if app.exit_requested else 'unexpected',
+                         'tray_exit' if app.exit_requested else 'mainloop_return')
     except Exception as exc:
-        window.withdraw()
-        messagebox.showerror('工具未能启动', str(exc))
-        window.destroy()
-        return
-    window.mainloop()
-    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel.CloseHandle(mutex)
+        if lifecycle:
+            lifecycle.error('main', type(exc), exc.__traceback__)
+            lifecycle.finish('failed', type(exc).__name__)
+        ctypes.windll.user32.MessageBoxW(0, '程序运行异常：' + str(exc) + '\n错误类型：' + type(exc).__name__ + '\n请查看本地运行诊断。', 'Claude Max', 0x10)
+    finally:
+        threading.excepthook = old_thread_hook
+        try:
+            if window and not (app and app.window_destroyed):
+                window.update_idletasks()
+                window.destroy()
+        finally:
+            try:
+                if lifecycle:
+                    lifecycle.close()
+            finally:
+                mutex.close()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        ctypes.windll.user32.MessageBoxW(0, '程序启动失败：' + str(exc) + '\n请从桌面快捷方式打开。', 'Claude Max', 0x10)

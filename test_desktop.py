@@ -4,12 +4,15 @@ import io
 import json
 import tkinter as tk
 import unittest
+import uuid
 from unittest.mock import patch
 
 import test_features
 from desktop import user, RESTORE
 from manager import App
 from core import read, write
+import manager
+from lifecycle import InstanceMutex
 
 
 class DesktopTests(unittest.TestCase):
@@ -136,6 +139,61 @@ class DesktopTests(unittest.TestCase):
             self.app.results[1]['next_poll'] = 0
             refresh.side_effect = [OSError('fixture'), None]
             self.pump(lambda: refresh.call_count >= 2)
+
+    def test_main_records_clean_exit_and_releases_native_mutex(self):
+        # Exercise the actual mainloop/finally path with isolated storage/mutex.
+        self.window.destroy()
+        mutex = InstanceMutex('Local\\ClaudeMaxManagerTest-' + uuid.uuid4().hex)
+        original_thread_hook = manager.threading.excepthook
+        def app(window, lifecycle, store):
+            instance = App(window, lifecycle, store)
+            window.after(250, instance.exit_app)
+            return instance
+        with patch('manager.restore_existing', return_value=False), \
+             patch('manager.process_in_job', return_value=False), \
+             patch('manager.InstanceMutex', return_value=mutex), \
+             patch('manager.accounts.ROOT', self.fixture.store.root), \
+             patch('manager.App', side_effect=app), \
+             patch('manager.ctypes.windll.user32.MessageBoxW') as error_box:
+            manager.main([])
+            error_box.assert_not_called()
+        saved = read(self.fixture.store.root / 'manager-runtime.json')
+        self.assertEqual(saved['status'], 'clean')
+        self.assertEqual(saved['reason'], 'tray_exit')
+        self.assertIsNone(mutex.handle)
+        self.assertIs(manager.threading.excepthook, original_thread_hook)
+
+    def test_main_brokers_host_launch_preserving_cli_path(self):
+        cli = self.fixture.base / 'CLI path 带空格.exe'
+        cli.touch()
+        with patch('manager.restore_existing', return_value=False), \
+             patch('manager.process_in_job', return_value=True), \
+             patch('manager.launch_independent') as launch, \
+             patch('manager.accounts.CLI'):
+            manager.main(['--cli-executable', str(cli)])
+            launch.assert_called_once_with(manager.HERE / 'manager.py',
+                                          ['--desktop-launch', '--cli-executable', str(cli)])
+            with self.assertRaises(RuntimeError):
+                manager.main(['--desktop-launch'])  # Never recursively broker.
+
+    def test_startup_failure_records_cause_and_closes_resources(self):
+        self.window.destroy()
+        mutex = InstanceMutex('Local\\ClaudeMaxManagerTest-' + uuid.uuid4().hex)
+        with patch('manager.restore_existing', return_value=False), \
+             patch('manager.process_in_job', return_value=False), \
+             patch('manager.InstanceMutex', return_value=mutex), \
+             patch('manager.accounts.ROOT', self.fixture.store.root), \
+             patch('manager.App', side_effect=RuntimeError('fixture setup detail')), \
+             patch('manager.ctypes.windll.user32.MessageBoxW') as error_box:
+            manager.main([])
+            self.assertIn('fixture setup detail', error_box.call_args.args[1])
+        saved = read(self.fixture.store.root / 'manager-runtime.json')
+        self.assertEqual(saved['status'], 'failed')
+        self.assertEqual(saved['last_error']['stage'], 'main')
+        self.assertNotIn('fixture setup detail', json.dumps(saved))
+        self.assertIsNone(mutex.handle)
+        fault = self.fixture.store.root / 'manager-fault.log'
+        fault.rename(fault.with_suffix('.closed'))  # Windows proves the handle closed.
 
 
 if __name__ == '__main__':
