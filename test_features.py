@@ -183,13 +183,24 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(before,[read(p) for p in [self.store.config,self.live/'.credentials.json']])
         self.assertFalse((self.root/'pending-switch.json').exists())
 
-    def test_unverified_version_cannot_live_switch(self):
+    def test_newer_running_session_switches_with_official_identity_check(self):
+        self.store.process_check=lambda:[123]
+        write(self.live/'sessions'/'fixture.json',{'pid':123,'version':'2.1.289'})
+        verified=SimpleNamespace(returncode=0,stdout=json.dumps({'loggedIn':True,'email':'account-2@example.invalid'}))
+        with patch('enhanced.sys.platform','win32'), patch('core.subprocess.run',return_value=verified) as cli:
+            self.assertIn('后续请求',self.store.switch(2,allow_running=True))
+            self.assertEqual(cli.call_count,1)
+            self.assertEqual(cli.call_args.args[0][1:],['auth','status','--json'])
+        self.assertEqual(self.store.current(),'uuid-2')
+        self.assertFalse((self.root/'pending-switch.json').exists())
+
+    def test_non_windows_live_switch_rejected_before_writing(self):
         self.store.process_check=lambda:[123]
         before=(self.live/'.credentials.json').read_bytes()
-        version=SimpleNamespace(returncode=0,stdout='0.0.0 (fixture)')
-        with patch('enhanced.subprocess.run',return_value=version):
-            with self.assertRaisesRegex(RuntimeError,'尚未验证'):
+        with patch('enhanced.sys.platform','linux'), patch('core.subprocess.run') as cli:
+            with self.assertRaisesRegex(RuntimeError,'Windows'):
                 self.store.switch(2,allow_running=True)
+            cli.assert_not_called()
         self.assertEqual(before,(self.live/'.credentials.json').read_bytes())
 
     def test_exhausted_pool_waits_and_runner_owns_rotation(self):

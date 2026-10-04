@@ -86,14 +86,9 @@ def runner_active():
 
 
 def require_live_switch_support():
-    """Gate live writes on the exact native CLI version exercised end to end."""
+    """Use Windows file credentials; the transaction verifies the target login."""
     if sys.platform != 'win32':
         raise RuntimeError('运行中切换目前只在 Windows 验证；请退出 Claude 后切换。')
-    result = subprocess.run([str(accounts.CLI), '--version'], capture_output=True,
-                            encoding='utf-8', timeout=15, creationflags=NO_WINDOW)
-    version = result.stdout.strip().split(' ', 1)[0]
-    if result.returncode or version != '2.1.288':
-        raise RuntimeError('此 Claude 版本尚未验证运行中切换（已验证 2.1.288）；请退出 Claude 后切换。')
 
 
 class Store(BasicStore):
@@ -401,14 +396,10 @@ class Store(BasicStore):
         return min(usable)[1] if usable else None
 
     def switch(self, slot, *, allow_running=False):
-        # Resolve compatibility before acquiring the official file-write locks.
+        # Version upgrades do not change the permission to attempt a live switch.
+        # The official identity check and rollback remain inside the transaction.
         if allow_running and self.process_check():
             require_live_switch_support()
-            active_pids = self.process_check()
-            for path in (self.live / 'sessions').glob('*.json'):
-                info = read(path)
-                if info.get('pid') in active_pids and info.get('version') not in (None, '2.1.288'):
-                    raise RuntimeError('发现未验证版本的运行中会话，请退出该会话后切换。')
         self.token(slot)
         with self.mutex, directory_lock(self.root / '.manager.lock'), self.credential_locks(self.live, self.config):
             message = super().switch(slot, allow_running=allow_running)
